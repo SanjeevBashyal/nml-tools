@@ -1,0 +1,3 @@
+&optional
+  count = not_an_integer
+/

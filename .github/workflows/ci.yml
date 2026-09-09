@@ -73,6 +73,8 @@ jobs:
         run: nml-tools check --config examples/04_derived_types/pyproject.toml --diff
       - name: Check generated 05_file_profiles files
         run: nml-tools check --config examples/05_file_profiles/nml-config.toml --diff
+      - name: Check generated optional-reader fixture files
+        run: nml-tools check --config tests/fortran_optional_read/nml-config.toml --diff
       - name: Validate 03_references template
         run: >
           nml-tools validate --config examples/03_references/nml-config.toml
@@ -116,6 +118,17 @@ jobs:
         run: >
           ./build/namelist-conformance/namelist_conformance
           tests/fortran_namelist/standard.nml
+      - name: Configure optional generated-reader conformance test
+        run: >
+          cmake -S tests/fortran_optional_read -B build/optional-generated-read -G Ninja
+          -DCMAKE_BUILD_TYPE=Debug
+          -DCMAKE_Fortran_FLAGS_DEBUG="${{ matrix.debug_flags }}"
+      - name: Build optional generated-reader conformance test
+        run: cmake --build build/optional-generated-read --parallel
+      - name: Run optional generated-reader conformance test
+        run: >
+          ./build/optional-generated-read/optional_generated_read
+          tests/fortran_optional_read
       - name: Build 01_simple
         run: >
           cmake -S examples/01_simple -B build/01_simple -G Ninja
