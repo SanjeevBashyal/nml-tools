@@ -889,6 +889,10 @@ Status codes (defined in the helper module):
 Notes:
 
 - `errmsg`, when present, is filled with a short message (including `iomsg` on read errors).
+- When every field has an effective default or is otherwise optional, a readable
+  file may omit that namelist group. `from_file` then succeeds with the same
+  initialized defaults and optional-value sentinels as an empty group. A missing
+  group still fails when any field requires input, and a missing file always fails.
 - `is_set` returns `NML_ERR_NOT_SET` if a value is missing, and
   `NML_ERR_INVALID_NAME`/`NML_ERR_INVALID_INDEX` on misuse.
 - `NML_ERR_INVALID_HANDLE` only reports zero f2py handles. Non-zero invalid

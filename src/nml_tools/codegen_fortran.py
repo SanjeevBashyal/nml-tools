@@ -1650,6 +1650,7 @@ def _build_context(
         "runtime_deallocations": runtime_deallocations,
         "runtime_local_allocations": runtime_local_allocations,
         "namelist_vars": namelist_vars,
+        "allow_missing_namelist": not required_input_names,
         "sentinel_assignments": sentinel_assignments,
         "default_assignments": default_assignments,
         "default_parameters": default_parameters,

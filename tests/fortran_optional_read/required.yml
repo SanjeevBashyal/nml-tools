@@ -1,0 +1,8 @@
+title: Required generated reader
+x-fortran-namelist: required
+type: object
+required: [count]
+properties:
+  count:
+    type: integer
+    x-fortran-kind: i4

@@ -1008,6 +1008,55 @@ def test_generate_fortran_required_defaults_make_setter_arguments_optional() -> 
     assert 'istat = this%is_set("flag", errmsg=errmsg)' not in generated
 
 
+def test_generate_fortran_allows_missing_group_without_input_required_fields() -> None:
+    codegen = _import_codegen_module()
+    schema = {
+        "x-fortran-namelist": "run",
+        "type": "object",
+        "required": ["count"],
+        "properties": {
+            "count": {"type": "integer", "default": 4},
+            "label": {"type": "string", "x-fortran-len": 16},
+        },
+    }
+
+    generated = codegen.render_fortran(schema, file_name="nml_run.f90")
+
+    missing_group_branch = """    if (status /= NML_OK) then
+      if (status == NML_ERR_NML_NOT_FOUND) then
+        close_status = nml%close(errmsg=errmsg)
+        if (close_status /= NML_OK) then
+          status = close_status
+          return
+        end if
+        this%is_configured = .true.
+        status = NML_OK
+        return
+      end if
+      close_status = nml%close()
+      return
+    end if"""
+    assert missing_group_branch in generated
+
+
+def test_generate_fortran_rejects_missing_group_with_input_required_fields() -> None:
+    codegen = _import_codegen_module()
+    schema = {
+        "x-fortran-namelist": "run",
+        "type": "object",
+        "required": ["count"],
+        "properties": {"count": {"type": "integer"}},
+    }
+
+    generated = codegen.render_fortran(schema, file_name="nml_run.f90")
+
+    find_start = generated.index('status = nml%find("run", errmsg=errmsg)')
+    find_end = generated.index("    ! read namelist")
+    find_block = generated[find_start:find_end]
+    assert "close_status = nml%close(errmsg=errmsg)" not in find_block
+    assert "this%is_configured = .true." not in find_block
+
+
 def test_generate_fortran_runtime_repeat_and_item_defaults_use_extent_policy() -> None:
     codegen = _import_codegen_module()
     repeated = {

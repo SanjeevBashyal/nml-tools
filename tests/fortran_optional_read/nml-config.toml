@@ -1,0 +1,16 @@
+[helper]
+path = "out/nml_helper.f90"
+module = "nml_helper"
+
+[kinds]
+module = "iso_fortran_env"
+integer = ["int32"]
+map = { i4 = "int32" }
+
+[[namelists]]
+schema = "optional.yml"
+mod_path = "out/nml_optional.f90"
+
+[[namelists]]
+schema = "required.yml"
+mod_path = "out/nml_required.f90"

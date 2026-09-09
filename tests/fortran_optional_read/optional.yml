@@ -1,0 +1,12 @@
+title: Optional generated reader
+x-fortran-namelist: optional
+type: object
+required: [count]
+properties:
+  count:
+    type: integer
+    x-fortran-kind: i4
+    default: 7
+  label:
+    type: string
+    x-fortran-len: 16

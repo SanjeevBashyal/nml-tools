@@ -1,10 +1,15 @@
-program namelist_conformance
+module setting_types
   implicit none
 
   type :: setting_t
     logical :: flag = .false.
     integer :: value = 0
   end type setting_t
+end module setting_types
+
+program namelist_conformance
+  use setting_types, only: setting_t
+  implicit none
 
   integer :: unit, stat
   integer :: values(2, 2) = -1
