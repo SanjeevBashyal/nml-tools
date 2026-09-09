@@ -108,13 +108,17 @@ jobs:
           nml-tools validate --schema tests/fortran_namelist/run.yml
           tests/fortran_namelist/standard.nml
       - name: Configure standard namelist conformance reader
+        # flang 23.1 aborts while lowering the derived-type namelist object in this fixture.
+        if: matrix.compiler != 'flang-new'
         run: >
           cmake -S tests/fortran_namelist -B build/namelist-conformance -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_Fortran_FLAGS_DEBUG="${{ matrix.debug_flags }}"
       - name: Build standard namelist conformance reader
+        if: matrix.compiler != 'flang-new'
         run: cmake --build build/namelist-conformance --parallel
       - name: Run standard namelist conformance reader
+        if: matrix.compiler != 'flang-new'
         run: >
           ./build/namelist-conformance/namelist_conformance
           tests/fortran_namelist/standard.nml
