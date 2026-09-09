@@ -43,6 +43,7 @@ jobs:
             experimental: false
             debug_flags: -g -O0 -traceback -check all
           - compiler: flang-new
+            compiler_version: 22.1.8
             experimental: false
             debug_flags: -g -O0
     steps:
@@ -58,6 +59,7 @@ jobs:
         uses: gha3mi/setup-fortran-conda@v0.15.3
         with:
           compiler: ${{ matrix.compiler }}
+          compiler-version: ${{ matrix.compiler_version }}
           extra-packages: pip
       - name: Install Python build tools
         run: python -m pip install -U pip build pytest
@@ -108,17 +110,13 @@ jobs:
           nml-tools validate --schema tests/fortran_namelist/run.yml
           tests/fortran_namelist/standard.nml
       - name: Configure standard namelist conformance reader
-        # flang 23.1 aborts while lowering the derived-type namelist object in this fixture.
-        if: matrix.compiler != 'flang-new'
         run: >
           cmake -S tests/fortran_namelist -B build/namelist-conformance -G Ninja
           -DCMAKE_BUILD_TYPE=Debug
           -DCMAKE_Fortran_FLAGS_DEBUG="${{ matrix.debug_flags }}"
       - name: Build standard namelist conformance reader
-        if: matrix.compiler != 'flang-new'
         run: cmake --build build/namelist-conformance --parallel
       - name: Run standard namelist conformance reader
-        if: matrix.compiler != 'flang-new'
         run: >
           ./build/namelist-conformance/namelist_conformance
           tests/fortran_namelist/standard.nml
