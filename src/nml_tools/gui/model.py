@@ -10,12 +10,12 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from itertools import product
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, cast
 
 import click
 
-from .._namelist_eval import EvaluatedGroup, LeafState, evaluate_group
-from .._namelist_parser import parse_namelist
+from .._namelist_eval import EvaluatedGroup, LeafState, _expand_values, _value_count, evaluate_group
+from .._namelist_parser import RawValue, ScalarSelector, parse_namelist
 from ..cli import (
     _iter_file_profiles,
     _load_config_checked,
@@ -27,7 +27,7 @@ from ..cli import (
 from ..codegen_fortran import _format_scalar_default
 from ..schema import SchemaResolver
 from ..validate import _scalar_constraints, _validate_scalar_value, validate_schema_defaults
-from .arrays import flex_tail_dims, initial_array, resolve_shape, validate_array_shape
+from .arrays import initial_array, resolve_shape
 
 MISSING = object()
 
@@ -332,16 +332,15 @@ def _evaluated_array(
     if not isinstance(items, Mapping):
         raise ValueError("array field must define object 'items'")
     shape = list(resolve_shape(schema, sizes))
-    flexible = flex_tail_dims(schema, len(shape))
     raw = schema["x-fortran-shape"]
     raw = raw if isinstance(raw, list) else [raw]
     for axis in range(len(shape)):
-        if raw[axis] != ":" and axis < len(shape) - flexible:
+        if raw[axis] != ":":
             continue
         used = [coordinates[axis] for coordinates, _, _ in states if coordinates]
         if used:
             shape[axis] = max(used)
-    result = suggestion({**schema, "x-fortran-shape": shape}, sizes)
+    result = cast(list[Any], suggestion({**schema, "x-fortran-shape": shape}, sizes))
     components = _component_names(items) if items.get("type") == "object" else {}
     for coordinates, component, state in states:
         target = result
@@ -437,10 +436,10 @@ def _normalize_value(
     if kind == "array":
         if not isinstance(value, list):
             raise ValueError(f"'{path}' must be an array")
-        validate_array_shape(schema, sizes, value)
         items = schema.get("items")
         if not isinstance(items, Mapping):
             raise ValueError(f"array '{path}' must define object items")
+        value = initial_array(schema, sizes, value, suggestion(items, sizes), strict=True)
 
         def normalize_items(node: Any, indices: tuple[int, ...] = ()) -> Any:
             if isinstance(node, list):
@@ -536,6 +535,86 @@ def _parsed_groups(path: Path) -> tuple[str, dict[str, Any]]:
     if not groups:
         raise ValueError(f"namelist file '{path}' contains no namelist groups")
     return text, groups
+
+
+def recover_dimensions(
+    project: GuiProject,
+    paths: Iterable[Path] | None = None,
+    overrides: Mapping[str, int] | None = None,
+) -> dict[str, int]:
+    """Infer editable sizes from saved indices before evaluating the namelists."""
+    if paths is None:
+        paths = (_profile_path(project, profile) for profile in project.profiles)
+    pages = project.namelists or tuple(page for p in project.profiles for page in p.pages)
+    schemas = {page.key: page.schema for page in pages}
+    extents: dict[str, int] = {}
+    explicit: dict[str, int] = {}
+    for path in dict.fromkeys(paths):
+        if not path.exists():
+            continue
+        _, groups = _parsed_groups(path)
+        saved: dict[str, int] = {}
+        for key, group in groups.items():
+            properties = {
+                name.lower(): prop
+                for name, prop in schemas.get(key, {}).get("properties", {}).items()
+            }
+            for assignment in group.assignments:
+                part = assignment.designator.parts[0]
+                name = part.name.lower()
+                prop = properties.get(name, {})
+                if (
+                    name in project.default_dimensions
+                    and prop.get("type") == "integer"
+                    and len(assignment.designator.parts) == 1
+                    and not part.selectors
+                ):
+                    for value in _expand_values(assignment):
+                        if isinstance(value, RawValue) and not value.quoted:
+                            saved[name] = int(value.source_text.split("_")[0])
+                if prop.get("type") != "array":
+                    continue
+                raw = prop["x-fortran-shape"]
+                shape = raw if isinstance(raw, list) else [raw]
+                selectors = part.selectors[0].selectors if part.selectors else ()
+                count = _value_count(assignment)
+                items = prop["items"]
+                if items.get("type") == "object" and len(assignment.designator.parts) == 1:
+                    count = (count + len(items["properties"]) - 1) // len(items["properties"])
+                for axis, token in enumerate(shape):
+                    dimension = str(token).lower()
+                    if dimension not in project.default_dimensions:
+                        continue
+                    selector = selectors[axis] if axis < len(selectors) else None
+                    extent = 0
+                    if isinstance(selector, ScalarSelector):
+                        extent = selector.value + (max(0, count - 1) if len(shape) == 1 else 0)
+                    elif selector is not None and selector.upper is not None:
+                        stride = selector.stride or 1
+                        indices = range(
+                            selector.lower or 1, selector.upper + (1 if stride > 0 else -1), stride
+                        )
+                        extent = max(indices[0], indices[-1]) if indices else 0
+                    elif len(shape) == 1:
+                        lower = (selector.lower or 1) if selector is not None else 1
+                        stride = (selector.stride or 1) if selector is not None else 1
+                        extent = max(lower, lower + (count - 1) * stride) if count else 0
+                    if extent > 0:
+                        extents[dimension] = max(extents.get(dimension, 0), extent)
+        for name, size in saved.items():
+            if name in explicit and explicit[name] != size:
+                raise ValueError(f"conflicting saved dimension '{name}'")
+            explicit[name] = size
+    _normalize_dimensions(overrides or {}, project)
+    # ponytail: sparse external files give lower bounds, not declared capacities.
+    dimensions = _normalize_dimensions(
+        {**extents, **explicit, **{name.lower(): size for name, size in (overrides or {}).items()}},
+        project,
+    )
+    for name, extent in extents.items():
+        if dimensions[name] < extent:
+            raise ValueError(f"dimension '{name}' is smaller than saved extent {extent}")
+    return dimensions
 
 
 def load_profile(

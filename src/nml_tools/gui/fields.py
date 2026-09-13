@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from collections.abc import Mapping
+from itertools import product
 from typing import Any, cast
 
 from qtpy.QtWidgets import (
@@ -13,19 +14,22 @@ from qtpy.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QWidget,
 )
 
+from ..schema import DERIVED_REF_ORIGIN_KEY
 from .arrays import (
     array_shape,
     axis_labels,
     canonical_array,
     display_array,
-    flex_tail_dims,
     initial_array,
     resolve_shape,
     table_axes,
@@ -184,6 +188,12 @@ class ArrayField(QWidget):
             candidate,
             suggestion(items, sizes),
             strict=saved and not fit_existing,
+            resize=saved and fit_existing,
+            defaults=suggestion(
+                {**schema, "x-fortran-shape": list(resolve_shape(schema, sizes, candidate))}, sizes
+            )
+            if saved and fit_existing
+            else None,
         )
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -216,7 +226,6 @@ class ArrayField(QWidget):
             self.layout().insertWidget(0, self.inline, 1)
         raw = self.schema.get("x-fortran-shape")
         resizable = raw == ":" or (isinstance(raw, list) and ":" in raw)
-        resizable = resizable or flex_tail_dims(self.schema, len(shape)) > 0
         self.summary.setVisible(self.inline is None)
         self.button.setVisible(self.inline is None or resizable)
         self.button.setText("Resize…" if self.inline is not None else "Edit array…")
@@ -241,7 +250,7 @@ class ArrayField(QWidget):
                 str(self.schema.get("title", self.name)),
                 xlabels=xlabels,
                 ylabels=ylabels,
-                variable_size=flex_tail_dims(self.schema, rank) > 0 or deferred,
+                variable_size=deferred,
             ):
                 return
             if _exec(editor) != _accepted(editor):
@@ -368,6 +377,93 @@ class FieldRow(QWidget):
         self.field = replacement
 
 
+class DerivedTable(QTableWidget):
+    """Same-reference objects as rows, reusing the existing component editors."""
+
+    def __init__(
+        self,
+        schemas: Mapping[str, Mapping[str, Any]],
+        values: Mapping[str, Any],
+        sizes: Mapping[str, int],
+        required: set[str],
+        parent: QWidget,
+        *,
+        fit_arrays: bool,
+    ) -> None:
+        super().__init__(parent)
+        self.schemas, self.sizes = schemas, sizes
+        self.data: dict[str, Any] = {}
+        self.objects: dict[tuple[str, tuple[int, ...]], ObjectField] = {}
+        first = next(iter(schemas.values()))
+        first = first["items"] if first["type"] == "array" else first
+        columns = list(first["properties"])
+        self.setColumnCount(len(columns))
+        self.setHorizontalHeaderLabels(columns)
+        header = cast(QHeaderView, self.horizontalHeader())
+        header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        for name, schema in schemas.items():
+            value = values.get(name, MISSING)
+            is_array = schema["type"] == "array"
+            item = schema["items"] if is_array else schema
+            if is_array:
+                self.data[name] = initial_array(
+                    schema,
+                    sizes,
+                    suggestion(schema, sizes) if value is MISSING else value,
+                    suggestion(item, sizes),
+                    strict=value is not MISSING and not fit_arrays,
+                    resize=value is not MISSING and fit_arrays,
+                    defaults=suggestion(
+                        {**schema, "x-fortran-shape": list(resolve_shape(schema, sizes, value))},
+                        sizes,
+                    )
+                    if value is not MISSING and fit_arrays
+                    else None,
+                )
+            else:
+                self.data[name] = {} if value is MISSING else value
+            shape = array_shape(self.data[name]) if is_array else ()
+            for indices in product(*(range(n) for n in shape)):
+                obj = ObjectField(item, _nested_get(self.data[name], indices), sizes, self)
+                obj.hide()
+                row = self.rowCount()
+                self.insertRow(row)
+                suffix = "(" + ",".join(str(i + 1) for i in indices) + ")" if indices else ""
+                label = QTableWidgetItem(name + suffix + (" *" if name.lower() in required else ""))
+                label.setToolTip(str(schema.get("description", schema.get("title", name))))
+                self.setVerticalHeaderItem(row, label)
+                for column, component in enumerate(columns):
+                    self.setCellWidget(row, column, obj.rows[component])
+                    label = QTableWidgetItem(
+                        component + (" *" if component in item.get("required", []) else "")
+                    )
+                    label.setToolTip(
+                        str(item["properties"][component].get("description", component))
+                    )
+                    self.setHorizontalHeaderItem(column, label)
+                self.objects[name, indices] = obj
+        self.resizeRowsToContents()
+        self.setMinimumHeight(
+            min(400, header.height() + sum(self.rowHeight(i) for i in range(self.rowCount())) + 4)
+        )
+
+    def values(self) -> dict[str, Any]:
+        result = copy.deepcopy(self.data)
+        for (name, indices), obj in self.objects.items():
+            if indices:
+                _nested_get(result[name], indices[:-1])[indices[-1]] = obj.value()
+            else:
+                result[name] = obj.value()
+        return result
+
+    def reset(self) -> None:
+        defaults = {name: suggestion(schema, self.sizes) for name, schema in self.schemas.items()}
+        for (name, indices), obj in self.objects.items():
+            obj.reset(self.sizes)
+            for component, value in _nested_get(defaults[name], indices).items():
+                obj.rows[component].set_value(value, self.sizes)
+
+
 class NamelistForm(QWidget):
     """Editable form for one namelist schema."""
 
@@ -390,10 +486,29 @@ class NamelistForm(QWidget):
         required = {item.lower() for item in schema.get("required", []) if isinstance(item, str)}
         layout = QFormLayout(self)
         self.rows: dict[str, FieldRow] = {}
+        self.tables: list[DerivedTable] = []
+        groups: dict[tuple[str, ...], dict[str, Mapping[str, Any]]] = {}
+        identities = {}
+        for name, child in properties.items():
+            item = child.get("items", {}) if child.get("type") == "array" else child
+            origin = item.get(DERIVED_REF_ORIGIN_KEY)
+            if item.get("type") == "object" and origin:
+                identity = tuple(origin["identity"])
+                identities[name] = identity
+                groups.setdefault(identity, {})[name] = child
         for name, child in properties.items():
             if not isinstance(name, str) or not isinstance(child, Mapping):
                 continue
             is_required = name.lower() in required
+            children = groups.get(identities.get(name, ()))
+            if children:
+                if name == next(iter(children)):
+                    table = DerivedTable(
+                        children, source, sizes, required, self, fit_arrays=fit_arrays
+                    )
+                    layout.addRow(table)
+                    self.tables.append(table)
+                continue
             row = FieldRow(
                 name,
                 child,
@@ -411,11 +526,15 @@ class NamelistForm(QWidget):
             value = row.value()
             if value is not MISSING:
                 result[name] = value
-        return result
+        for table in self.tables:
+            result.update(table.values())
+        return {name: result[name] for name in self.schema["properties"] if name in result}
 
     def reset(self) -> None:
         for row in self.rows.values():
             row.reset(self.sizes)
+        for table in self.tables:
+            table.reset()
 
 
 def _field_widget(

@@ -11,6 +11,7 @@ from nml_tools.gui.model import (
     load_profile,
     load_project,
     overlay_values,
+    recover_dimensions,
     save_profiles,
     suggestion,
 )
@@ -182,6 +183,37 @@ def test_missing_input_import_errors_and_partial_array_input(tmp_path):
         path.write_text(text)
         with pytest.raises(ValueError):
             import_profile(project, path, {})
+
+
+def test_complete_arrays_and_recover_dimensions_before_loading(tmp_path):
+    _write_project(tmp_path)
+    project = load_project(tmp_path)
+    profile = project.profile("main")
+    schema = next(page.schema for page in project.namelists if page.key == "alpha")
+    weights = schema["properties"]["weights"]
+    weights.update({"x-fortran-shape": [2, "n_items"], "x-fortran-flex-tail-dims": 1})
+    path = tmp_path / "main.nml"
+    for size in (3, 1):
+        values = {"alpha": {"count": 1, "weights": [[4.0], [5.0]]}}
+        save_profiles(project, [(profile, values, {"n_items": size})])
+        assert f"weights(2,{size}) =" in path.read_text()
+        dimensions = recover_dimensions(project)
+        assert dimensions == {"n_items": size}
+        assert load_profile(project, profile, dimensions)["alpha"]["weights"] == [
+            [4.0] + [0.0] * (size - 1),
+            [5.0] + [0.0] * (size - 1),
+        ]
+    weights["x-fortran-shape"] = "n_items"
+    path.write_text("&alpha count=1 weights(2:6:2)=3*1.0 /\n")
+    assert recover_dimensions(project) == {"n_items": 6}
+    assert recover_dimensions(project, overrides={"N_ITEMS": 7}) == {"n_items": 7}
+    with pytest.raises(ValueError, match="smaller than saved extent"):
+        recover_dimensions(project, overrides={"n_items": 1})
+    path.write_text("&alpha count=1 weights(2:)=3*1.0 /\n")
+    assert recover_dimensions(project) == {"n_items": 4}
+    schema["properties"]["n_items"] = {"type": "integer"}
+    path.write_text("&alpha count=1 n_items=7 weights(1)=4.0 /\n")
+    assert recover_dimensions(project) == {"n_items": 7}
 
 
 def test_array_defaults_use_fortran_order_and_declared_padding():

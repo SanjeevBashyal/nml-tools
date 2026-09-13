@@ -8,7 +8,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from qtpy.QtCore import Qt
+from qtpy.QtCore import QSignalBlocker, Qt
 from qtpy.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -44,6 +44,7 @@ from .model import (
     load_profile,
     load_project,
     overlay_values,
+    recover_dimensions,
     save_profiles,
 )
 
@@ -272,6 +273,12 @@ class ConfigurationDialog(QDialog):
         self.dimensions = _normalize_dimensions(
             {} if initial_dimensions is None else initial_dimensions, project
         )
+        self.dimension_overrides = initial_dimensions or {}
+        recovery_error = None
+        try:
+            self.dimensions = recover_dimensions(project, overrides=self.dimension_overrides)
+        except (OSError, ValueError) as exc:
+            recovery_error = str(exc)
         self.initial_values: dict[str, Any] = {}
         if initial_values is not None:
             if not isinstance(initial_values, Mapping):
@@ -298,7 +305,7 @@ class ConfigurationDialog(QDialog):
         root.addWidget(self.tabs, 1)
         self.plus_tab = QWidget(self.tabs)
         self.tabs.addTab(self.plus_tab, "+")
-        self.config_tab = self._add_config(primary=True)
+        self.config_tab: ProfileConfigTab | None = self._add_config(primary=True)
         for side in (QTabBar.LeftSide, QTabBar.RightSide):
             self.tabs.tabBar().setTabButton(self.tabs.indexOf(self.plus_tab), side, None)
         self.tabs.currentChanged.connect(self._tab_changed)
@@ -314,7 +321,9 @@ class ConfigurationDialog(QDialog):
             button.clicked.connect(callback)
             actions.addWidget(button)
         root.addLayout(actions)
-        if project.profiles:
+        if recovery_error:
+            QMessageBox.critical(self, "Invalid configuration", recovery_error)
+        elif project.profiles and self.config_tab is not None:
             self._run_configuration(self.config_tab)
 
     @staticmethod
@@ -362,10 +371,13 @@ class ConfigurationDialog(QDialog):
 
     def _close_tab(self, index: int) -> None:
         widget = self.tabs.widget(index)
-        if widget is self.plus_tab:
+        if widget is None or widget is self.plus_tab:
             return
         try:
-            dirty = isinstance(widget, ProfileTab) and widget.values() != widget.saved_values
+            dirty = isinstance(widget, ProfileTab) and (
+                widget.values() != widget.saved_values
+                or widget.dimensions != widget.saved_dimensions
+            )
         except ValueError:
             dirty = True
         if dirty:
@@ -375,9 +387,20 @@ class ConfigurationDialog(QDialog):
             ):
                 return
         self.editors = {path: tab for path, tab in self.editors.items() if tab is not widget}
-        self.config_tabs.discard(widget)
-        self.tabs.removeTab(index)
-        widget.deleteLater()
+        self._remove_tab(widget)
+
+    def _remove_tab(self, widget: QWidget) -> None:
+        with QSignalBlocker(self.tabs):
+            index = self.tabs.indexOf(widget)
+            self.config_tabs.discard(widget)
+            self.tabs.removeTab(index)
+            if widget is self.config_tab:
+                self.config_tab = None
+            widget.deleteLater()
+            if self.tabs.count() == 1:
+                self.config_tab = self._add_config(primary=True)
+            elif self.tabs.currentWidget() is self.plus_tab:
+                self.tabs.setCurrentIndex(min(index, self.tabs.count() - 2))
 
     def _browse(self, tab: ProfileConfigTab) -> None:
         name, _ = QFileDialog.getOpenFileName(
@@ -393,12 +416,17 @@ class ConfigurationDialog(QDialog):
     def _select_source(self, tab: ProfileConfigTab) -> None:
         name = tab.source_combo.currentData()
         tab.source_path = Path(name) if name else None
-        if not tab.builder or not name:
+        if not name:
             return
         try:
-            profile, _ = import_profile(self.project, Path(name), tab.dimensions())
+            dimensions = recover_dimensions(self.project, [Path(name)], self.dimension_overrides)
+            profile, _ = import_profile(self.project, Path(name), dimensions)
         except (OSError, ValueError) as exc:
             QMessageBox.critical(self, "Invalid namelist", str(exc))
+            return
+        for key, size in dimensions.items():
+            tab.dimension_boxes[key].setValue(size)
+        if not tab.builder:
             return
         tab.profile_name.setText(profile.name)
         tab.default_filename.setText(profile.default_file)
@@ -411,6 +439,7 @@ class ConfigurationDialog(QDialog):
 
     def _run_configuration(self, config: ProfileConfigTab) -> None:
         prepared: list[ProfileTab] = []
+        allow_shrink = False
         try:
             dimensions = _normalize_dimensions(config.dimensions(), self.project)
             imported: dict[str, Any] | None = None
@@ -435,6 +464,23 @@ class ConfigurationDialog(QDialog):
                 previous = self.editors.get(target)
                 if previous is not None and (config.builder or config.source_path is not None):
                     raise ValueError(f"'{target.name}' is already open")
+                if (
+                    previous
+                    and not allow_shrink
+                    and any(size < previous.dimensions[key] for key, size in dimensions.items())
+                ):
+                    if (
+                        QMessageBox.question(
+                            self,
+                            "Resize arrays",
+                            "Smaller dimensions will discard trailing array values. Continue?",
+                        )
+                        != QMessageBox.Yes
+                    ):
+                        for editor in prepared:
+                            editor.deleteLater()
+                        return
+                    allow_shrink = True
                 values = (
                     previous.values()
                     if previous
@@ -466,9 +512,7 @@ class ConfigurationDialog(QDialog):
                 self._put_editor(editor)
             self.dimensions = dimensions
             if config.builder or config.source_path is not None:
-                self.config_tabs.discard(config)
-                self.tabs.removeTab(self.tabs.indexOf(config))
-                config.deleteLater()
+                self._remove_tab(config)
         except (OSError, ValueError, KeyError) as exc:
             for editor in prepared:
                 editor.deleteLater()

@@ -118,7 +118,7 @@ def test_derived_array_initialization_does_not_share_mutable_defaults() -> None:
     assert initialized == [{"enabled": True}, {"enabled": False}]
 
 
-def test_saved_array_shapes_are_preserved_or_rejected_without_coercion() -> None:
+def test_saved_arrays_are_completed_without_repeating_or_moving_values() -> None:
     flexible = {
         "x-fortran-shape": "max_items",
         "x-fortran-flex-tail-dims": 1,
@@ -129,7 +129,11 @@ def test_saved_array_shapes_are_preserved_or_rejected_without_coercion() -> None
         [10, 20],
         0,
         strict=True,
-    ) == [10, 20]
+    ) == [10, 20, 0, 0, 0]
+    assert initial_array({"x-fortran-shape": [2, 3]}, {}, [[1, 2], [3, 4]], 9, resize=True) == [
+        [1, 2, 9],
+        [3, 4, 9],
+    ]
 
     with pytest.raises(ValueError, match="does not match declared shape"):
         initial_array(

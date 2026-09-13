@@ -5,6 +5,7 @@ import os
 import pytest
 
 from nml_tools.gui.model import GuiProfile, GuiProject, NamelistPage
+from nml_tools.schema import resolve_schema
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 pytest.importorskip("qtpy")
@@ -14,7 +15,7 @@ except ImportError:
     pytest.skip("Qt binding unavailable", allow_module_level=True)
 
 from nml_tools.gui.app import ConfigurationDialog, ProfileConfigTab
-from nml_tools.gui.fields import ArrayField, FieldRow, ObjectField, ScalarField
+from nml_tools.gui.fields import ArrayField, FieldRow, NamelistForm, ObjectField, ScalarField
 
 
 @pytest.fixture(scope="module")
@@ -33,7 +34,9 @@ def project(tmp_path):
             "weights": {
                 "type": "array",
                 "x-fortran-shape": "n",
-                "items": {"type": "number", "default": 1.0},
+                "items": {"type": "number"},
+                "default": [1.0],
+                "x-fortran-default-repeat": True,
             },
             "periods": {
                 "type": "array",
@@ -85,6 +88,7 @@ def test_derived_singletons_use_inline_object_fields(application, project):
 def test_dialog_load_overlay_save_reload_and_dimension_changes(application, project, monkeypatch):
     errors = []
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args[-1]))
+    monkeypatch.setattr(QMessageBox, "question", lambda *args: QMessageBox.Yes)
     path = project.root / "run.nml"
     path.write_text('&run count=8 label="saved" weights(1)=2.0 periods(1)%year=2021 /\n')
     dialog = ConfigurationDialog(project, initial_values={"main": {"run": {"count": 9}}})
@@ -97,9 +101,15 @@ def test_dialog_load_overlay_save_reload_and_dimension_changes(application, proj
     dialog.config_tab.dimension_boxes["n"].setValue(2)
     dialog.config_tab.run.click()
     assert dialog.editors[path].forms["run"].rows["weights"].field.inline is None
+    assert dialog.editors[path].values()["run"]["weights"] == [2.0, 1.0]
+    dialog._save_all()
+    loaded = ConfigurationDialog(project)
+    assert loaded.config_tab.dimension_boxes["n"].value() == 2
+    loaded.close()
     dialog.config_tab.dimension_boxes["n"].setValue(1)
     dialog.config_tab.run.click()
     assert isinstance(dialog.editors[path].forms["run"].rows["weights"].field.inline, ScalarField)
+    dialog._save_all()
     reloaded = ConfigurationDialog(project)
     assert reloaded.editors[path].values()["run"]["periods"] == [{"year": 2025}]
     dialog.tabs.setCurrentWidget(dialog.plus_tab)
@@ -155,11 +165,12 @@ def test_imported_profile_can_choose_its_output_and_keep_loaded_values(
     errors = []
     monkeypatch.setattr(QMessageBox, "critical", lambda *args: errors.append(args[-1]))
     path = project.root / "external.nml"
-    path.write_text('&run count=42 /\n')
+    path.write_text("&run count=42 weights(3)=9.0 /\n")
     dialog = ConfigurationDialog(project)
     dialog.tabs.setCurrentWidget(dialog.plus_tab)
     config = dialog.tabs.currentWidget()
     config.source_combo.setCurrentIndex(config.source_combo.findData(str(path)))
+    assert config.dimension_boxes["n"].value() == 3
     config.profile_name.setText("copy")
     config.default_filename.setText("copy.nml")
     config.run.click()
@@ -167,7 +178,7 @@ def test_imported_profile_can_choose_its_output_and_keep_loaded_values(
     assert dialog.editors[copy_path].values()["run"]["count"] == 42
     dialog.editors[copy_path].save.click()
     assert copy_path.exists()
-    assert path.read_text() == '&run count=42 /\n'
+    assert path.read_text() == "&run count=42 weights(3)=9.0 /\n"
     assert not errors
     dialog.close()
 
@@ -181,3 +192,82 @@ def test_public_launch_forwards_profile_selection(application, monkeypatch, tmp_
     values = {"main": {"run": {"count": 8}}}
     assert launch_gui(tmp_path, tmp_path / "out", selected, values, {"n": 1}) == 0
     assert calls == [(tmp_path, tmp_path / "out", selected, values, {"n": 1})]
+
+
+def test_active_and_last_config_tabs_close(application, project):
+    dialog = ConfigurationDialog(project)
+    dialog.tabs.setCurrentWidget(dialog.plus_tab)
+    builder = dialog.tabs.currentWidget()
+    dialog._close_tab(dialog.tabs.indexOf(builder))
+    assert dialog.tabs.indexOf(builder) == -1 and len(dialog.config_tabs) == 1
+    dialog._close_tab(dialog.tabs.indexOf(dialog.config_tab))
+    assert dialog.config_tab is None
+    dialog._close_tab(dialog.tabs.indexOf(next(iter(dialog.editors.values()))))
+    last = dialog.config_tab
+    dialog._close_tab(dialog.tabs.indexOf(last))
+    assert dialog.config_tab is not last and dialog.tabs.count() == 2
+    dialog.close()
+
+
+def test_shared_reference_table_edit_reset_and_round_trip(application, tmp_path):
+    from nml_tools.gui.model import load_profile, recover_dimensions, save_profiles
+
+    schema = resolve_schema(
+        {
+            "type": "object",
+            "x-fortran-namelist": "run",
+            "$defs": {
+                "period": {
+                    "type": "object",
+                    "x-fortran-type": "period_t",
+                    "properties": {
+                        "year": {"type": "integer", "default": 2000},
+                        "enabled": {"type": "boolean", "default": False},
+                    },
+                    "required": ["year"],
+                }
+            },
+            "properties": {
+                "start": {"$ref": "#/$defs/period", "default": {"year": 2001}},
+                "stop": {"$ref": "#/$defs/period", "default": {"year": 2002}},
+                "periods": {
+                    "type": "array",
+                    "x-fortran-shape": "n",
+                    "items": {"$ref": "#/$defs/period"},
+                },
+            },
+        }
+    )
+    form = NamelistForm(schema, None, {"n": 2})
+    (table,) = form.tables
+    form.show()
+    application.processEvents()
+    assert table.cellWidget(0, 0).isVisible()
+    assert (table.rowCount(), table.columnCount()) == (4, 2)
+    assert table.horizontalHeaderItem(0).text() == "year *"
+    table.objects["periods", (1,)].rows["year"].field.set_value(2025)
+    table.objects["periods", (1,)].rows["enabled"].field.set_value(True)
+    values = form.values()
+    assert values["periods"][1] == {"year": 2025, "enabled": True}
+    page = NamelistPage("run", "run", schema)
+    profile = GuiProfile("main", "main", "Main", None, "run.nml", (page,))
+    project = GuiProject(tmp_path, {}, {"n": 100}, (profile,), namelists=(page,))
+    save_profiles(project, [(profile, {"run": values}, {"n": 2})])
+    assert load_profile(project, profile, recover_dimensions(project)) == {"run": values}
+    form.reset()
+    assert form.values()["start"]["year"] == 2001
+    assert form.values()["stop"]["year"] == 2002
+    assert form.values()["periods"][1]["year"] == 2000
+    for name, indices in (("start", ()), ("periods", (0,))):
+        single = NamelistForm(
+            {**schema, "properties": {name: schema["properties"][name]}}, None, {"n": 1}
+        )
+        (single_table,) = single.tables
+        assert (single_table.rowCount(), single_table.columnCount()) == (1, 2)
+        assert single_table.horizontalHeaderItem(0).text() == "year *"
+        defaults = single.values()
+        single_table.objects[name, indices].rows["year"].field.set_value(2035)
+        edited = {"year": 2035, "enabled": False}
+        assert single.values()[name] == ([edited] if indices else edited)
+        single.reset()
+        assert single.values() == defaults

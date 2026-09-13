@@ -178,10 +178,16 @@ def initial_array(
     leaf_default: Any,
     *,
     strict: bool = False,
+    resize: bool = False,
+    defaults: list[Any] | None = None,
 ) -> list[Any]:
     """Fit a saved/default/example value to the resolved canonical shape."""
     shape = resolve_shape(schema, sizes, value)
-    result = cast(list[Any], _filled(shape, leaf_default))
+    result = (
+        copy.deepcopy(defaults)
+        if defaults is not None
+        else cast(list[Any], _filled(shape, leaf_default))
+    )
     if value is None:
         return result
     if not isinstance(value, list):
@@ -191,17 +197,19 @@ def initial_array(
     current_shape = _list_shape(value)
     if strict:
         validate_array_shape(schema, sizes, value)
-        return copy.deepcopy(value)
-    if current_shape and flex_tail_dims(schema, len(shape)):
-        try:
-            validate_array_shape(schema, sizes, value)
-        except ValueError:
-            pass
-        else:
-            return copy.deepcopy(value)
-    if current_shape == shape:
-        return copy.deepcopy(value)
+    if strict or resize or (current_shape and len(current_shape) == len(shape)):
+        if len(current_shape) != len(shape):
+            raise ValueError("saved array rank does not match its declared shape")
 
+        def overlay(target: list[Any], source: list[Any]) -> None:
+            for index, item in enumerate(source[: len(target)]):
+                if isinstance(target[index], list):
+                    overlay(target[index], item)
+                else:
+                    target[index] = copy.deepcopy(item)
+
+        overlay(result, value)
+        return result
     flat = list(_flatten(value))
     if not flat:
         return result
